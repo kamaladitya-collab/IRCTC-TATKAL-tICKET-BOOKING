@@ -1,0 +1,308 @@
+/*
+ * IRCTC Tatkal Train Booking System and Concurrent Seat Locker
+ * ------------------------------------------------------------
+ * Concepts demonstrated:
+ *   1. Abstract class + inheritance  (Ticket -> TatkalTicket)
+ *   2. Thread safety with 'synchronized' (BookingEngine)
+ *   3. Temporary seat hold with a 2-second payment window
+ *   4. Custom (checked) exceptions
+ *   5. Multithreading simulation (8 passengers, 5 seats)
+ *
+ * Compile:  javac Main.java
+ * Run:      java Main
+ */
+
+// =====================================================================
+// PART 1: CUSTOM EXCEPTIONS
+// =====================================================================
+
+// Thrown when every seat is already held or booked.
+class NoBerthsAvailableException extends Exception {
+    public NoBerthsAvailableException(String message) {
+        super(message);
+    }
+}
+
+// Thrown when the passenger does not finish payment within the hold time.
+class BookingTimeoutException extends Exception {
+    public BookingTimeoutException(String message) {
+        super(message);
+    }
+}
+
+// =====================================================================
+// PART 2: OOP & INHERITANCE
+// =====================================================================
+
+// Abstract class: we can NOT create a plain Ticket object.
+// It only defines what every kind of ticket must have.
+abstract class Ticket {
+    protected String passengerName;
+    protected double baseFare;
+
+    public Ticket(String passengerName, double baseFare) {
+        this.passengerName = passengerName;
+        this.baseFare = baseFare;
+    }
+
+    public String getPassengerName() {
+        return passengerName;
+    }
+
+    // Abstract method: every subclass MUST provide its own version.
+    public abstract double calculateFare();
+}
+
+// Concrete subclass: a Tatkal ticket costs the base fare + 30% surge fee.
+class TatkalTicket extends Ticket {
+    private static final double SURGE_PERCENT = 0.30; // 30%
+
+    public TatkalTicket(String passengerName, double baseFare) {
+        super(passengerName, baseFare); // call the parent constructor
+    }
+
+    @Override
+    public double calculateFare() {
+        double surgeFee = baseFare * SURGE_PERCENT;
+        return baseFare + surgeFee;
+    }
+}
+
+// =====================================================================
+// PART 3: THREAD-SAFE BOOKING ENGINE
+// =====================================================================
+
+class BookingEngine {
+
+    // Each seat is in exactly one of these three states.
+    private static final int AVAILABLE = 0;
+    private static final int HELD = 1;    // locked temporarily, waiting for payment
+    private static final int BOOKED = 2;  // payment done, seat is confirmed
+
+    // A passenger gets 2 seconds (2000 ms) to finish payment.
+    private static final long HOLD_LIMIT_MS = 2000;
+
+    // Fixed-size arrays: index 0 = Seat 1, index 1 = Seat 2, and so on.
+    private final int[] seatState;
+    private final long[] holdStartTime;   // when the hold began (milliseconds)
+    private final String[] seatHolder;    // who is holding / owns the seat
+
+    public BookingEngine(int totalSeats) {
+        seatState = new int[totalSeats];
+        holdStartTime = new long[totalSeats];
+        seatHolder = new String[totalSeats];
+        // All seats start as AVAILABLE (0) because int arrays default to 0.
+    }
+
+    /*
+     * STEP A: Try to hold (lock) a seat for a passenger.
+     *
+     * 'synchronized' means only ONE thread can be inside any synchronized
+     * method of this object at a time. Without it, two threads could both
+     * see the same seat as AVAILABLE and both grab it (a "race condition").
+     */
+    public synchronized int holdSeat(String passengerName) throws NoBerthsAvailableException {
+
+        // First, give back any seats whose 2-second hold has run out.
+        releaseExpiredHolds();
+
+        // Look for the first free seat.
+        for (int i = 0; i < seatState.length; i++) {
+            if (seatState[i] == AVAILABLE) {
+                seatState[i] = HELD;
+                holdStartTime[i] = System.currentTimeMillis();
+                seatHolder[i] = passengerName;
+                return i; // return the seat index to the caller
+            }
+        }
+
+        // No free seat found.
+        throw new NoBerthsAvailableException("No berths available. All seats are held or booked.");
+    }
+
+    /*
+     * STEP B: Confirm the booking after payment.
+     * If more than 2 seconds passed since the hold started, the seat is
+     * released back to the pool and BookingTimeoutException is thrown.
+     */
+    public synchronized void confirmBooking(int seatIndex, String passengerName)
+            throws BookingTimeoutException {
+
+        // Does this passenger still own the hold on this seat?
+        // (If the hold expired earlier, the seat may have been released
+        //  or even given to somebody else.)
+        boolean stillMine = (seatState[seatIndex] == HELD)
+                && passengerName.equals(seatHolder[seatIndex]);
+
+        if (stillMine) {
+            long elapsed = System.currentTimeMillis() - holdStartTime[seatIndex];
+            if (elapsed <= HOLD_LIMIT_MS) {
+                seatState[seatIndex] = BOOKED; // success!
+                return;
+            }
+            // Too slow: release the seat so others can book it.
+            releaseSeat(seatIndex);
+        }
+
+        throw new BookingTimeoutException(
+                "Payment not completed within 2 seconds. Seat " + (seatIndex + 1)
+                        + " released back to the pool.");
+    }
+
+    // Puts one seat back into the available pool.
+    // (Private helper: only called from synchronized methods above,
+    //  so the lock is already held.)
+    private void releaseSeat(int seatIndex) {
+        seatState[seatIndex] = AVAILABLE;
+        seatHolder[seatIndex] = null;
+        holdStartTime[seatIndex] = 0;
+        System.out.println("   [ENGINE] Seat " + (seatIndex + 1) + " is AVAILABLE again.");
+    }
+
+    // Releases every HELD seat whose 2-second window has passed.
+    private void releaseExpiredHolds() {
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < seatState.length; i++) {
+            if (seatState[i] == HELD && (now - holdStartTime[i]) > HOLD_LIMIT_MS) {
+                releaseSeat(i);
+            }
+        }
+    }
+
+    // Prints the final seat chart. Synchronized so we read a consistent state.
+    public synchronized void printSeatChart() {
+        for (int i = 0; i < seatState.length; i++) {
+            String status;
+            if (seatState[i] == BOOKED) {
+                status = "BOOKED by " + seatHolder[i];
+            } else if (seatState[i] == HELD) {
+                status = "HELD by " + seatHolder[i];
+            } else {
+                status = "AVAILABLE";
+            }
+            System.out.println("   Seat " + (i + 1) + ": " + status);
+        }
+    }
+}
+
+// =====================================================================
+// PART 4: PASSENGER THREAD
+// =====================================================================
+
+// Each passenger is a separate thread trying to book a seat.
+class PassengerThread extends Thread {
+
+    private final BookingEngine engine;
+    private final long paymentTimeMs; // how long this passenger takes to pay
+    private boolean booked = false;   // true if booking succeeded
+
+    public PassengerThread(String name, BookingEngine engine, long paymentTimeMs) {
+        super(name); // sets the thread name, e.g. "Passenger-1"
+        this.engine = engine;
+        this.paymentTimeMs = paymentTimeMs;
+    }
+
+    public boolean isBooked() {
+        return booked;
+    }
+
+    // run() is what the thread executes after start() is called.
+    @Override
+    public void run() {
+        String me = getName();
+        TatkalTicket ticket = new TatkalTicket(me, 1000.0); // base fare Rs. 1000
+
+        try {
+            System.out.println("[" + me + "] Step 1: Requesting a Tatkal seat...");
+
+            // Try to lock a seat (may throw NoBerthsAvailableException).
+            int seat = engine.holdSeat(me);
+            System.out.println("[" + me + "] Step 2: Seat " + (seat + 1)
+                    + " HELD. Paying Rs. " + ticket.calculateFare()
+                    + " (payment will take " + paymentTimeMs + " ms)...");
+
+            // Simulate the payment. IMPORTANT: this sleep is OUTSIDE any
+            // synchronized block, so other passengers are NOT blocked meanwhile.
+            Thread.sleep(paymentTimeMs);
+
+            // Confirm the booking (may throw BookingTimeoutException).
+            engine.confirmBooking(seat, me);
+            System.out.println("[" + me + "] Step 3: Payment done. Seat " + (seat + 1)
+                    + " BOOKED. SUCCESS!");
+            booked = true;
+
+        } catch (NoBerthsAvailableException e) {
+            System.out.println("[" + me + "] FAILED (NoBerthsAvailableException): " + e.getMessage());
+        } catch (BookingTimeoutException e) {
+            System.out.println("[" + me + "] FAILED (BookingTimeoutException): " + e.getMessage());
+        } catch (InterruptedException e) {
+            System.out.println("[" + me + "] Interrupted while paying.");
+        }
+    }
+}
+
+// =====================================================================
+// PART 5: MAIN - SIMULATION
+// =====================================================================
+
+public class Main {
+
+    public static void main(String[] args) throws InterruptedException {
+
+        // ---------------------------------------------------------
+        // DEMO 1: Show the 2-second payment timeout on its own.
+        // This passenger takes 3 seconds to pay, so the hold expires.
+        // ---------------------------------------------------------
+        System.out.println("========== DEMO 1: PAYMENT TIMEOUT ==========");
+        BookingEngine demoEngine = new BookingEngine(5);
+        PassengerThread slowPassenger = new PassengerThread("Slow-Passenger", demoEngine, 3000);
+        slowPassenger.start();
+        slowPassenger.join(); // wait until this thread finishes
+        System.out.println("Seat chart after Demo 1:");
+        demoEngine.printSeatChart();
+
+        // ---------------------------------------------------------
+        // DEMO 2: 8 passengers compete for 5 seats at the same time.
+        // ---------------------------------------------------------
+        System.out.println();
+        System.out.println("========== DEMO 2: 8 PASSENGERS, 5 SEATS ==========");
+        BookingEngine engine = new BookingEngine(5);
+        PassengerThread[] passengers = new PassengerThread[8];
+
+        // Create the 8 threads. Payment takes 500-850 ms (well under 2 seconds).
+        for (int i = 0; i < passengers.length; i++) {
+            String name = "Passenger-" + (i + 1);
+            long paymentTime = 500 + (i * 50);
+            passengers[i] = new PassengerThread(name, engine, paymentTime);
+        }
+
+        // Start them all (almost) simultaneously.
+        for (int i = 0; i < passengers.length; i++) {
+            passengers[i].start();
+        }
+
+        // Wait for ALL threads to finish before printing the summary.
+        for (int i = 0; i < passengers.length; i++) {
+            passengers[i].join();
+        }
+
+        // Count successes and failures.
+        int successCount = 0;
+        int failureCount = 0;
+        for (int i = 0; i < passengers.length; i++) {
+            if (passengers[i].isBooked()) {
+                successCount++;
+            } else {
+                failureCount++;
+            }
+        }
+
+        System.out.println();
+        System.out.println("========== SUMMARY ==========");
+        System.out.println("Successful bookings : " + successCount);
+        System.out.println("Failed bookings     : " + failureCount
+                + " (NoBerthsAvailableException)");
+        System.out.println("Final seat chart:");
+        engine.printSeatChart();
+    }
+}
